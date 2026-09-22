@@ -1,0 +1,377 @@
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity ^0.5.10;
+
+/**
+ * SecureRealEstatePlatform - v5
+ * - FIXED: SafeERC20 for Nile USDT compatibility (no boolean returns)
+ * - FIXED: depositDividends pulls from msg.sender instead of stored dividend wallet
+ * - ReentrancyGuard
+ * - Contract-held funds for share purchases
+ * - On-chain dividend distribution
+ */
+
+library SafeMath {
+    function add(uint256 a, uint256 b) internal pure returns (uint256) {
+        uint256 c = a + b;
+        require(c >= a, "SafeMath: addition overflow");
+        return c;
+    }
+    function sub(uint256 a, uint256 b) internal pure returns (uint256) {
+        require(b <= a, "SafeMath: subtraction underflow");
+        return a - b;
+    }
+    function mul(uint256 a, uint256 b) internal pure returns (uint256) {
+        if (a == 0) return 0;
+        uint256 c = a * b;
+        require(c / a == b, "SafeMath: multiplication overflow");
+        return c;
+    }
+    function div(uint256 a, uint256 b) internal pure returns (uint256) {
+        require(b > 0, "SafeMath: division by zero");
+        return a / b;
+    }
+}
+
+interface IERC20 {
+    // Removed boolean returns for legacy USDT compatibility
+    function transfer(address to, uint256 value) external;
+    function transferFrom(address from, address to, uint256 value) external;
+    function allowance(address owner, address spender) external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+}
+
+/** SafeERC20 helper for legacy tokens that don't return bool */
+library SafeERC20 {
+    function safeTransfer(IERC20 token, address to, uint256 value) internal {
+        // Remove boolean return check for legacy token compatibility
+        (bool success, ) = address(token).call(abi.encodeWithSelector(token.transfer.selector, to, value));
+        require(success, "SafeERC20: transfer failed");
+    }
+    
+    function safeTransferFrom(IERC20 token, address from, address to, uint256 value) internal {
+        // Remove boolean return check for legacy token compatibility  
+        (bool success, ) = address(token).call(abi.encodeWithSelector(token.transferFrom.selector, from, to, value));
+        require(success, "SafeERC20: transferFrom failed");
+    }
+}
+
+contract ReentrancyGuard {
+    uint256 private _status;
+    constructor () internal { _status = 1; }
+    modifier nonReentrant() {
+        require(_status == 1, "ReentrancyGuard: reentrant call");
+        _status = 2;
+        _;
+        _status = 1;
+    }
+}
+
+contract SecureRealEstatePlatform is ReentrancyGuard {
+    using SafeMath for uint256;
+    using SafeERC20 for IERC20;
+
+    string public platformName = "RealEstate Platform";
+    string public platformSymbol = "REAL";
+    address public platformAdmin;
+    address public usdtToken;
+    address public developerWallet;
+    uint256 public buyFee = 4100000; // 6-decimal USDT units ($4.10)
+    uint256 public liquidationFeePercent = 1000; // basis points (10% = 1000)
+
+    enum PropertyStatus { ACTIVE, FUNDED, COMPLETED, CANCELLED }
+
+    uint256 private currentCompanyId = 0;
+    uint256 private currentPropertyId = 0;
+
+    struct Company {
+        uint256 companyId;
+        string companyCode;
+        string name;
+        address wallet;
+        bool registered;
+        uint256 propertyCount;
+        string image;
+    }
+
+    struct Property {
+        uint256 propertyId;
+        uint256 companyId;
+        string propertyCode;
+        string propertyURI;
+        uint256 totalShares;
+        uint256 sharePrice;
+        uint256 totalRaised;
+        uint256 sharesSold;
+        PropertyStatus status;
+        address fundraisingWallet; // kept for bookkeeping
+        address dividendWallet;
+        string image;
+    }
+
+    mapping(uint256 => Company) public companies;
+    mapping(uint256 => Property) public properties;
+    mapping(string => uint256) public codeToCompanyId;
+    mapping(string => uint256) public codeToPropertyId;
+    mapping(address => uint256) public walletToCompanyId;
+    mapping(uint256 => uint256[]) public companyProperties;
+    mapping(address => mapping(uint256 => uint256)) public investorShares;
+    mapping(uint256 => uint256) public propertyFunds;
+
+    // Dividend accounting (cumulative per-share model)
+    uint256 constant internal POINTS = 10**18;
+    mapping(uint256 => uint256) public accDividendPerShare;
+    mapping(address => mapping(uint256 => uint256)) public investorDividendCredited;
+
+    // Events
+    event CompanyRegistered(uint256 indexed companyId, string companyCode, string name, address wallet, string image);
+    event PropertyCreated(uint256 indexed propertyId, string propertyCode, uint256 indexed companyId, string propertyURI, uint256 totalShares, uint256 sharePrice, address fundraisingWallet, address dividendWallet, string image);
+    event SharesPurchased(uint256 indexed propertyId, address indexed investor, uint256 shares, uint256 amount, uint256 fee);
+    event FundsLiquidated(uint256 indexed propertyId, uint256 amount, uint256 fee);
+    event SalesClosed(uint256 indexed propertyId, PropertyStatus status);
+    event DividendsDeposited(uint256 indexed propertyId, uint256 amount);
+    event DividendsClaimed(uint256 indexed propertyId, address indexed investor, uint256 amount);
+
+    modifier onlyAdmin() { require(msg.sender == platformAdmin, "Only admin"); _; }
+    modifier onlyCompanyOwner(uint256 propertyId) {
+        uint256 companyId = properties[propertyId].companyId;
+        require(companies[companyId].wallet == msg.sender, "Only company owner");
+        _; 
+    }
+
+    constructor(address _usdtToken, address _developerWallet) public {
+        require(_usdtToken != address(0), "Invalid USDT address");
+        require(_developerWallet != address(0), "Invalid developer wallet");
+        usdtToken = _usdtToken;
+        developerWallet = _developerWallet;
+        platformAdmin = msg.sender;
+    }
+
+    // ----------------- Company & Property -----------------
+
+    function registerCompany(string memory companyName, address companyWallet, string memory image) public returns (uint256) {
+        require(walletToCompanyId[companyWallet] == 0, "Company exists");
+        require(bytes(companyName).length > 0, "Name required");
+        require(companyWallet != address(0), "Invalid wallet");
+
+        currentCompanyId++;
+        string memory companyCode = generateCompanyCode(companyName, currentCompanyId);
+        require(codeToCompanyId[companyCode] == 0, "Code exists");
+
+        companies[currentCompanyId] = Company(currentCompanyId, companyCode, companyName, companyWallet, true, 0, image);
+        walletToCompanyId[companyWallet] = currentCompanyId;
+        codeToCompanyId[companyCode] = currentCompanyId;
+
+        emit CompanyRegistered(currentCompanyId, companyCode, companyName, companyWallet, image);
+        return currentCompanyId;
+    }
+
+    function createProperty(address companyWallet, string memory propertyURI, uint256 totalShares, uint256 sharePrice, address fundraisingWallet, address dividendWallet, string memory image) public returns (uint256, string memory) {
+        uint256 companyId = walletToCompanyId[companyWallet];
+        require(companyId != 0, "Company not found");
+        require(companies[companyId].registered, "Company inactive");
+        require(totalShares > 0 && sharePrice > 0, "Invalid shares/price");
+        require(fundraisingWallet != address(0) && dividendWallet != address(0), "Invalid wallets");
+        require(bytes(propertyURI).length > 0, "URI required");
+
+        currentPropertyId++;
+        string memory companyCode = companies[companyId].companyCode;
+        string memory propertyCode = string(abi.encodePacked(companyCode, "-P", uintToString(companies[companyId].propertyCount + 1)));
+        require(codeToPropertyId[propertyCode] == 0, "Property code exists");
+
+        properties[currentPropertyId] = Property(currentPropertyId, companyId, propertyCode, propertyURI, totalShares, sharePrice, 0, 0, PropertyStatus.ACTIVE, fundraisingWallet, dividendWallet, image);
+        codeToPropertyId[propertyCode] = currentPropertyId;
+        companyProperties[companyId].push(currentPropertyId);
+        companies[companyId].propertyCount++;
+
+        emit PropertyCreated(currentPropertyId, propertyCode, companyId, propertyURI, totalShares, sharePrice, fundraisingWallet, dividendWallet, image);
+        return (currentPropertyId, propertyCode);
+    }
+
+    // ----------------- Buying shares (investor -> contract) -----------------
+
+    function buyShares(uint256 propertyId, uint256 shareCount) public nonReentrant {
+        Property storage p = properties[propertyId];
+        require(p.status == PropertyStatus.ACTIVE, "Not active");
+        require(shareCount > 0, "Min 1 share");
+        require(p.sharesSold.add(shareCount) <= p.totalShares, "Not enough shares");
+
+        uint256 shareCost = p.sharePrice.mul(shareCount);
+        uint256 totalCost = shareCost.add(buyFee);
+
+        IERC20 token = IERC20(usdtToken);
+        require(token.allowance(msg.sender, address(this)) >= totalCost, "Approve USDT first");
+        require(token.balanceOf(msg.sender) >= totalCost, "Insufficient balance");
+
+        // Transfer investor funds into contract (fixed for legacy USDT)
+        token.safeTransferFrom(msg.sender, address(this), totalCost);
+
+        // Update dividend-credit bookkeeping for new shares
+        investorDividendCredited[msg.sender][propertyId] = investorDividendCredited[msg.sender][propertyId].add(
+            accDividendPerShare[propertyId].mul(shareCount)
+        );
+
+        p.sharesSold = p.sharesSold.add(shareCount);
+        p.totalRaised = p.totalRaised.add(shareCost);
+        propertyFunds[propertyId] = propertyFunds[propertyId].add(shareCost);
+        investorShares[msg.sender][propertyId] = investorShares[msg.sender][propertyId].add(shareCount);
+
+        // Distribute fee immediately to developer (fixed for legacy USDT)
+        token.safeTransfer(developerWallet, buyFee);
+
+        // If sold out, mark as funded
+        if (p.sharesSold >= p.totalShares) {
+            p.status = PropertyStatus.FUNDED;
+            emit SalesClosed(propertyId, PropertyStatus.FUNDED);
+        }
+        emit SharesPurchased(propertyId, msg.sender, shareCount, shareCost, buyFee);
+    }
+
+    // ----------------- Close & Liquidation -----------------
+
+    function closeSales(uint256 propertyId) public onlyCompanyOwner(propertyId) {
+        Property storage p = properties[propertyId];
+        require(p.status == PropertyStatus.ACTIVE, "Already closed");
+        p.status = PropertyStatus.COMPLETED;
+        emit SalesClosed(propertyId, PropertyStatus.COMPLETED);
+    }
+
+    function liquidateFunds(uint256 propertyId, uint256 amount) public onlyCompanyOwner(propertyId) nonReentrant {
+        Property storage p = properties[propertyId];
+        require(p.status == PropertyStatus.FUNDED || p.status == PropertyStatus.COMPLETED, "Sales not closed");
+        require(amount > 0 && propertyFunds[propertyId] >= amount, "Invalid amount");
+
+        uint256 liquidationFee = amount.mul(liquidationFeePercent).div(10000);
+        uint256 companyProceeds = amount.sub(liquidationFee);
+
+        // Update state first
+        propertyFunds[propertyId] = propertyFunds[propertyId].sub(amount);
+
+        IERC20 token = IERC20(usdtToken);
+        token.safeTransfer(developerWallet, liquidationFee);
+        token.safeTransfer(companies[p.companyId].wallet, companyProceeds);
+
+        emit FundsLiquidated(propertyId, amount, liquidationFee);
+    }
+
+    // ----------------- Dividends (on-chain, cumulative per-share) -----------------
+
+    function depositDividends(uint256 propertyId, uint256 amount) public nonReentrant returns (bool) {
+        require(amount > 0, "Amount required");
+        Property storage p = properties[propertyId];
+        require(p.propertyId != 0, "Property not found");
+        require(p.sharesSold > 0, "No shares sold");
+
+        // Only dividend wallet or admin can deposit
+        require(msg.sender == p.dividendWallet || msg.sender == platformAdmin, "Not authorized to deposit dividends");
+
+        IERC20 token = IERC20(usdtToken);
+        
+        // FIXED: Pull from the caller (msg.sender) instead of dividend wallet
+        token.safeTransferFrom(msg.sender, address(this), amount);
+
+        // Increase accumulated dividend per share
+        accDividendPerShare[propertyId] = accDividendPerShare[propertyId].add(
+            amount.mul(POINTS).div(p.sharesSold)
+        );
+
+        propertyFunds[propertyId] = propertyFunds[propertyId].add(amount);
+
+        emit DividendsDeposited(propertyId, amount);
+        return true;
+    }
+
+    function claimDividends(uint256 propertyId) public nonReentrant returns (uint256) {
+        uint256 userShares = investorShares[msg.sender][propertyId];
+        require(userShares > 0, "No shares");
+        require(accDividendPerShare[propertyId] > 0, "No dividends distributed");
+
+        uint256 entitledScaled = accDividendPerShare[propertyId].mul(userShares);
+        uint256 creditedScaled = investorDividendCredited[msg.sender][propertyId];
+
+        require(entitledScaled > creditedScaled, "Nothing to claim");
+
+        uint256 withdrawable = entitledScaled.sub(creditedScaled).div(POINTS);
+        require(withdrawable > 0, "Nothing to claim");
+
+        investorDividendCredited[msg.sender][propertyId] = accDividendPerShare[propertyId].mul(userShares);
+
+        require(propertyFunds[propertyId] >= withdrawable, "Contract has insufficient funds for dividends");
+        propertyFunds[propertyId] = propertyFunds[propertyId].sub(withdrawable);
+
+        IERC20 token = IERC20(usdtToken);
+        token.safeTransfer(msg.sender, withdrawable);
+
+        emit DividendsClaimed(propertyId, msg.sender, withdrawable);
+        return withdrawable;
+    }
+
+    // ----------------- Helpers & Views -----------------
+
+    function generateCompanyCode(string memory companyName, uint256 companyId) internal pure returns (string memory) {
+        bytes memory nameBytes = bytes(companyName);
+        require(nameBytes.length >= 3, "Name too short");
+        bytes memory codeBytes = new bytes(3);
+        for (uint i = 0; i < 3; i++) {
+            byte char = nameBytes[i];
+            if (char >= 0x61 && char <= 0x7A) char = byte(uint8(char) - 32);
+            codeBytes[i] = char;
+        }
+        return string(abi.encodePacked(string(codeBytes), formatSequentialNumber(companyId)));
+    }
+
+    function formatSequentialNumber(uint256 number) internal pure returns (string memory) {
+        if (number < 10) return string(abi.encodePacked("00", uintToString(number)));
+        if (number < 100) return string(abi.encodePacked("0", uintToString(number)));
+        return uintToString(number);
+    }
+
+    function uintToString(uint256 value) internal pure returns (string memory) {
+        if (value == 0) return "0";
+        uint256 temp = value;
+        uint256 digits;
+        while (temp != 0) {
+            digits++;
+            temp /= 10;
+        }
+        bytes memory buffer = new bytes(digits);
+        while (value != 0) {
+            digits -= 1;
+            buffer[digits] = bytes1(uint8(48 + uint256(value % 10)));
+            value /= 10;
+        }
+        return string(buffer);
+    }
+
+    function getCompanyProperties(uint256 companyId) public view returns (uint256[] memory) { return companyProperties[companyId]; }
+    function getCurrentPropertyId() public view returns (uint256) { return currentPropertyId; }
+    function getBuyFee() public view returns (uint256) { return buyFee; }
+    function getLiquidationFeePercent() public view returns (uint256) { return liquidationFeePercent; }
+    function getDeveloperWallet() public view returns (address) { return developerWallet; }
+    function getPendingDividendsScaled(uint256 propertyId) public view returns (uint256) { return accDividendPerShare[propertyId]; }
+    function getClaimedDividends(address investor, uint256 propertyId) public view returns (uint256) {
+        uint256 scaled = investorDividendCredited[investor][propertyId];
+        return scaled.div(POINTS);
+    }
+    function getPlatformAdmin() public view returns (address) { return platformAdmin; }
+    function checkAllowance(address user) public view returns (uint256) { return IERC20(usdtToken).allowance(user, address(this)); }
+    function checkBalance(address user) public view returns (uint256) { return IERC20(usdtToken).balanceOf(user); }
+
+    // Admin controls
+    function transferAdmin(address newAdmin) public onlyAdmin {
+        require(newAdmin != address(0), "Invalid admin");
+        platformAdmin = newAdmin;
+    }
+    
+    function updateFees(uint256 newBuyFee, uint256 newLiquidationFee) public onlyAdmin {
+        require(newBuyFee > 0, "Buy fee required");
+        require(newLiquidationFee <= 2000, "Fee too high"); // Max 20%
+        buyFee = newBuyFee;
+        liquidationFeePercent = newLiquidationFee;
+    }
+
+    // Emergency token recovery (non-USDT)
+    function recoverTokens(address tokenAddress, uint256 amount) public onlyAdmin {
+        require(tokenAddress != usdtToken, "Cannot recover USDT");
+        IERC20(tokenAddress).safeTransfer(platformAdmin, amount);
+    }
+}
